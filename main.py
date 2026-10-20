@@ -2,7 +2,6 @@ import os
 import sys
 import logging
 import sqlite3
-import json
 from datetime import datetime
 import httpx
 from aiohttp import web
@@ -17,21 +16,21 @@ from aiogram.types import (
 )
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-# --- Asosiy Sozlamalar ---
+# --- Asosiy Konfiguratsiya ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     logging.critical("FATAL: BOT_TOKEN muhit o'zgaruvchisi topilmadi!")
     sys.exit(1)
 
 PROVIDER_API_KEY = os.environ.get("PROVIDER_API_KEY", "hd_1729ff0cbba09a19877994bf65044cbba6bd")
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://englih.onrender.com")
 PORT = int(os.environ.get("PORT", 8080))
-WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+WEBHOOK_PATH = "/webhook"
 PROVIDER_BASE_URL = "https://api.geminipro7.store"
 
 ADMIN_ID = 5523761749
 
-# Qo'shilgan faol mahsulotlar (ID : Narxi Starsda)
+# Qo'shilgan faol mahsulotlar (ID : Ma'lumot)
 ACTIVE_PRODUCTS = {
     "gp_1": {
         "title": "Gemini Pro (18 Months)",
@@ -94,30 +93,23 @@ def get_stats():
 init_db()
 
 
-# --- Upstream API Bilan Ishlash ---
+# --- Yetkazib beruvchi API ---
 async def fetch_upstream_products():
-    """Yetkazib beruvchidan tovarlar ro'yxatini yuklaydi va barcha variantlarni tekshiradi."""
     headers = {"X-API-Key": PROVIDER_API_KEY}
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
             res = await client.get(f"{PROVIDER_BASE_URL}/products", headers=headers)
             if res.status_code != 200:
-                logger.error(f"Products fetch error: {res.status_code} - {res.text}")
+                logger.error(f"Products error: {res.status_code} - {res.text}")
                 return []
-
             data = res.json()
-            
-            # Agar javob to'g'ridan-to'g'ri list bo'lsa
             if isinstance(data, list):
                 return data
-            
-            # Agar lug'at ichida kelsa
             if isinstance(data, dict):
                 for key in ["products", "data", "items", "services"]:
                     if key in data and isinstance(data[key], list):
                         return data[key]
                 return [data]
-
             return []
         except Exception as e:
             logger.error(f"API fetch exception: {e}")
@@ -167,7 +159,7 @@ async def admin_orders(message: types.Message):
         text += (
             f"🔹 **Buyurtma #{order[0]}**\n"
             f"👤 User: `{order[1]}`\n"
-            f"📦 Mahsulot ID: `{order[2]}`\n"
+            f"📦 Mahsulot: `{order[2]}`\n"
             f"⭐ To'lov: {order[3]} Stars\n"
             f"📊 Holat: {status_icon}\n"
             f"🕒 Sana: {order[5]}\n"
@@ -211,7 +203,6 @@ async def admin_balance(message: types.Message):
 
 @dp.message(Command("products"))
 async def admin_products_list(message: types.Message):
-    """Admin uchun mahsulotlarning Nomi, ID si va Narxini matn ko'rinishida chiqarib beradi."""
     if message.from_user.id != ADMIN_ID:
         return
 
@@ -219,10 +210,10 @@ async def admin_products_list(message: types.Message):
     products = await fetch_upstream_products()
 
     if not products:
-        await loading.edit_text("❌ Yetkazib beruvchida tovarlar topilmadi yoki API da xatolik.")
+        await loading.edit_text("❌ Yetkazib beruvchida tovarlar topilmadi.")
         return
 
-    msg = "📦 **Ombordagi Barcha Mahsulotlar (Nomi - ID - Narxi):**\n\n"
+    msg = "📦 **Ombordagi Barcha Mahsulotlar:**\n\n"
     for item in products:
         p_id = item.get("service_id") or item.get("id") or item.get("product_id") or "Noma'lum"
         name = item.get("name") or item.get("title") or "Nomsiz tovar"
@@ -236,7 +227,6 @@ async def admin_products_list(message: types.Message):
         )
 
     await loading.delete()
-    # Telegram xabar chegarasidan oshmasligi uchun bo'laklab chiqarish
     if len(msg) > 4000:
         for chunk in [msg[i:i+4000] for i in range(0, len(msg), 4000)]:
             await message.answer(chunk, parse_mode="Markdown")
@@ -246,7 +236,6 @@ async def admin_products_list(message: types.Message):
 
 @dp.message(Command("debug"))
 async def admin_debug(message: types.Message):
-    """API dan kelayotgan xom javobni ko'rsatish."""
     if message.from_user.id != ADMIN_ID:
         return
 
@@ -264,8 +253,8 @@ async def admin_debug(message: types.Message):
 async def start_handler(message: types.Message):
     welcome_text = (
         "👋 **Xush kelibsiz!**\n\n"
-        "Ushbu bot orqali rasmiy premium obunalarni qulay narxlarda Telegram Stars orqali xarid qilishingiz mumkin.\n\n"
-        "Quyidagi tugma orqali katalog bilan tanishing:"
+        "Rasmiy premium obunalarni qulay narxlarda Telegram Stars orqali xarid qilishingiz mumkin.\n\n"
+        "Mahsulotlar bilan tanishish uchun quyidagi tugmani bosing:"
     )
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -290,14 +279,13 @@ async def show_catalog_handler(callback: types.CallbackQuery):
         name = item.get("name") or item.get("title") or "Mahsulot"
         price = item.get("price") or item.get("cost") or "0"
         
-        # Tugmada Nomi - ID - Narxi ko'rinadi
-        button_text = f"📦 {name} | ID: {p_id} (${price})"
+        button_text = f"📦 {name} (${price})"
         buttons.append([InlineKeyboardButton(text=button_text, callback_data=f"info_{p_id}")])
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     await callback.message.edit_text(
-        "📦 **Mavjud tovarlar ro'yxati:**\n"
-        "Batafsil ma'lumot va xarid qilish uchun tanlang:",
+        "📦 **Mavjud tovarlar:**\n"
+        "Batafsil ma'lumot olish uchun tanlang:",
         reply_markup=keyboard,
         parse_mode="Markdown"
     )
@@ -324,7 +312,7 @@ async def show_product_detail(callback: types.CallbackQuery):
     else:
         text = (
             f"📦 **Mahsulot ID:** `{service_id}`\n\n"
-            "ℹ️ Ushbu mahsulot hozirda sozlanish jarayonida. Tez orada xarid qilish imkoniyati ochiladi!"
+            "ℹ️ Ushbu mahsulot hozirda sozlanish jarayonida. Tez orada xarid qilish ochiladi!"
         )
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="◀️ Katalogga qaytish", callback_data="show_catalog")]]
@@ -366,7 +354,7 @@ async def process_payment(message: types.Message):
     payload_parts = payment.invoice_payload.split("_")
     service_id = payload_parts[1] if len(payload_parts) > 1 else "gp_1"
 
-    status_msg = await message.answer("🔄 **To'lov tasdiqlandi!** Yetkazib beruvchi tizimidan litsenziya olinmoqda...")
+    status_msg = await message.answer("🔄 **To'lov tasdiqlandi!** Litsenziya olinmoqda...")
 
     status_code, data = await purchase_supplier_product(service_id=service_id, quantity=1)
 
@@ -404,10 +392,14 @@ async def health_check(request):
     return web.Response(text="Bot is operational")
 
 async def on_startup(app):
-    if RENDER_EXTERNAL_URL:
-        webhook_url = f"{RENDER_EXTERNAL_URL.rstrip('/')}{WEBHOOK_PATH}"
-        await bot.set_webhook(url=webhook_url, drop_pending_updates=True)
-        logger.info(f"Webhook o'rnatildi: {webhook_url}")
+    base_url = RENDER_EXTERNAL_URL.rstrip("/")
+    if not base_url.startswith("http"):
+        base_url = f"https://{base_url}"
+
+    webhook_url = f"{base_url}{WEBHOOK_PATH}"
+    await bot.delete_webhook(drop_pending_updates=True)
+    await bot.set_webhook(url=webhook_url)
+    logger.info(f"✅ Webhook muvaffaqiyatli o'rnatildi: {webhook_url}")
 
 async def on_shutdown(app):
     await bot.delete_webhook()
@@ -416,10 +408,14 @@ async def on_shutdown(app):
 def main():
     app = web.Application()
     app.router.add_get("/", health_check)
+
+    # Webhook handler
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
+
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
+
     web.run_app(app, host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
