@@ -13,8 +13,8 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     LabeledPrice,
     PreCheckoutQuery,
+    Update,
 )
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 # --- Asosiy Konfiguratsiya ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -25,12 +25,10 @@ if not BOT_TOKEN:
 PROVIDER_API_KEY = os.environ.get("PROVIDER_API_KEY", "hd_1729ff0cbba09a19877994bf65044cbba6bd")
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://englih.onrender.com")
 PORT = int(os.environ.get("PORT", 8080))
-WEBHOOK_PATH = "/webhook"
 PROVIDER_BASE_URL = "https://api.geminipro7.store"
 
 ADMIN_ID = 5523761749
 
-# Qo'shilgan faol mahsulotlar (ID : Ma'lumot)
 ACTIVE_PRODUCTS = {
     "gp_1": {
         "title": "Gemini Pro (18 Months)",
@@ -93,7 +91,7 @@ def get_stats():
 init_db()
 
 
-# --- Yetkazib beruvchi API ---
+# --- Upstream API ---
 async def fetch_upstream_products():
     headers = {"X-API-Key": PROVIDER_API_KEY}
     async with httpx.AsyncClient(timeout=15.0) as client:
@@ -210,7 +208,7 @@ async def admin_products_list(message: types.Message):
     products = await fetch_upstream_products()
 
     if not products:
-        await loading.edit_text("❌ Yetkazib beruvchida tovarlar topilmadi.")
+        await loading.edit_text("❌ Omborda tovarlar topilmadi.")
         return
 
     msg = "📦 **Ombordagi Barcha Mahsulotlar:**\n\n"
@@ -387,19 +385,32 @@ async def process_payment(message: types.Message):
         )
 
 
-# --- Server & Webhook Lifecycle ---
+# --- Kafolatlangan Webhook Handler (To'g'ridan-to'g'ri routing) ---
 async def health_check(request):
-    return web.Response(text="Bot is operational")
+    return web.Response(text="Bot is operational and running!")
+
+async def handle_telegram_webhook(request):
+    """Telegram'dan kelgan har bir so'rovni bevosita aiogram dispatcherga uzatadi."""
+    try:
+        data = await request.json()
+        update = Update.model_validate(data, context={"bot": bot})
+        await dp.feed_update(bot, update)
+    except Exception as e:
+        logger.error(f"Webhook update processing error: {e}")
+    return web.Response(text="OK")
 
 async def on_startup(app):
     base_url = RENDER_EXTERNAL_URL.rstrip("/")
     if not base_url.startswith("http"):
         base_url = f"https://{base_url}"
 
-    webhook_url = f"{base_url}{WEBHOOK_PATH}"
+    webhook_url = f"{base_url}/webhook"
+    
+    # 1. Eski xabarlar navbatini butunlay tozalash
     await bot.delete_webhook(drop_pending_updates=True)
+    # 2. Yangi webhookni aniq URL ga o'rnatish
     await bot.set_webhook(url=webhook_url)
-    logger.info(f"✅ Webhook muvaffaqiyatli o'rnatildi: {webhook_url}")
+    logger.info(f"🚀 WEBHOOK O'RNATILDI: {webhook_url}")
 
 async def on_shutdown(app):
     await bot.delete_webhook()
@@ -407,11 +418,12 @@ async def on_shutdown(app):
 
 def main():
     app = web.Application()
+    
+    # Render tekshiruvi uchun GET /
     app.router.add_get("/", health_check)
-
-    # Webhook handler
-    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
-    setup_application(app, dp, bot=bot)
+    
+    # Telegram xabarlari uchun to'g'ridan-to'g'ri POST /webhook
+    app.router.add_post("/webhook", handle_telegram_webhook)
 
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
