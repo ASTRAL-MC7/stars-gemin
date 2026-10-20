@@ -12,12 +12,12 @@ from aiogram.types import (
     LabeledPrice,
     PreCheckoutQuery,
 )
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 
-# --- Sozlamalar ---
+# --- Konfiguratsiya ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
-    logging.critical("FATAL: BOT_TOKEN topilmadi!")
+    logging.critical("BOT_TOKEN muhit o'zgaruvchisi topilmadi!")
     sys.exit(1)
 
 PROVIDER_API_KEY = os.environ.get("PROVIDER_API_KEY", "hd_1729ff0cbba09a19877994bf65044cbba6bd")
@@ -29,20 +29,18 @@ SERVICE_ID = os.environ.get("SERVICE_ID", "gp_1")
 STARS_PRICE = 150
 ADMIN_ID = 5523761749
 
-# Birinchi ishlagan xavfsiz webhook yo'li
+# Birinchi ishlagan asl webhook yo'li
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+WEBHOOK_URL = f"{RENDER_EXTERNAL_URL.rstrip('/')}{WEBHOOK_PATH}"
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Buyurtmalarni vaqtincha xotirada saqlash (serverni qotirmaslik uchun)
-ORDERS_HISTORY = []
 
-
-# --- API Helper ---
+# --- Upstream API Helper ---
 async def purchase_supplier_product(service_id: str, quantity: int = 1):
     headers = {
         "X-API-Key": PROVIDER_API_KEY,
@@ -54,13 +52,13 @@ async def purchase_supplier_product(service_id: str, quantity: int = 1):
             res = await client.post(f"{PROVIDER_BASE_URL}/order", headers=headers, json=payload)
             return res.status_code, res.json()
         except Exception as e:
-            logger.error(f"Fulfillment call error: {e}")
+            logger.error(f"Fulfillment xatosi: {e}")
             return 500, {"error": str(e)}
 
 
 # --- Admin Buyruqlari ---
 @dp.message(Command("balance"))
-async def check_balance(message: types.Message):
+async def admin_balance(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
     headers = {"X-API-Key": PROVIDER_API_KEY}
@@ -72,29 +70,15 @@ async def check_balance(message: types.Message):
             await message.answer(f"Xato: {e}")
 
 
-@dp.message(Command("orders"))
-async def show_orders(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    if not ORDERS_HISTORY:
-        await message.answer("ℹ️ Hozircha yangi buyurtmalar yo'q.")
-        return
-
-    text = "📋 **Oxirgi buyurtmalar:**\n\n"
-    for o in ORDERS_HISTORY[-10:]:
-        text += f"👤 User: `{o['user']}` | ⭐ {o['stars']} Stars | Holat: {o['status']}\n"
-    await message.answer(text, parse_mode="Markdown")
-
-
 @dp.message(Command("products"))
-async def show_raw_products(message: types.Message):
+async def admin_products(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
     headers = {"X-API-Key": PROVIDER_API_KEY}
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             res = await client.get(f"{PROVIDER_BASE_URL}/products", headers=headers)
-            await message.answer(f"📦 **API javobi (/products):**\n```json\n{res.text[:3500]}\n```", parse_mode="Markdown")
+            await message.answer(f"📦 **Mahsulotlar API javobi:**\n```json\n{res.text[:3500]}\n```", parse_mode="Markdown")
         except Exception as e:
             await message.answer(f"Xato: {e}")
 
@@ -149,7 +133,7 @@ async def process_successful_payment(message: types.Message):
     payment_info = message.successful_payment
     logger.info(f"To'lov tushdi: {payment_info.total_amount} Stars")
 
-    status_msg = await message.answer("🔄 **To'lov qabul qilindi!** Litsenziya olinmoqda...")
+    status_msg = await message.answer("🔄 **To'lov qabul qilindi!** Mahsulot olinmoqda...")
 
     status_code, data = await purchase_supplier_product(service_id=SERVICE_ID, quantity=1)
 
@@ -163,8 +147,6 @@ async def process_successful_payment(message: types.Message):
         )
         order_id = data.get("order_id", "N/A")
 
-        ORDERS_HISTORY.append({"user": message.from_user.id, "stars": payment_info.total_amount, "status": "✅ Yetkazildi"})
-
         await status_msg.edit_text(
             f"✅ **Purchase Successful!**\n\n"
             f"Here are your access details:\n"
@@ -174,46 +156,40 @@ async def process_successful_payment(message: types.Message):
             parse_mode="Markdown"
         )
     else:
-        ORDERS_HISTORY.append({"user": message.from_user.id, "stars": payment_info.total_amount, "status": "❌ Xato"})
         await status_msg.edit_text(
             "⚠️ **Order Delivery Notice**\n\n"
-            "To'lov qabul qilindi, lekin yetkazib beruvchi tizimida kechikish bo'ldi. "
+            "To'lov qabul qilindi, lekin yetkazib berishda kechikish bo'ldi. "
             "Iltimos, adminga quyidagi to'lov ID sini yuboring:\n"
             f"`{payment_info.telegram_payment_charge_id}`",
             parse_mode="Markdown"
         )
 
 
-# --- Server va Webhook (Birinchi ishlagan original setup) ---
+# --- Birinchi ishlagan original server lifecycle ---
 async def health_check(request):
-    return web.Response(text="Bot is operational")
+    return web.Response(text="Bot is running!")
 
 async def on_startup(app):
-    base_url = RENDER_EXTERNAL_URL.rstrip("/")
-    if not base_url.startswith("http"):
-        base_url = f"https://{base_url}"
-    webhook_url = f"{base_url}{WEBHOOK_PATH}"
-
-    await bot.delete_webhook(drop_pending_updates=True)
-    await bot.set_webhook(url=webhook_url)
-    logger.info(f"Webhook o'rnatildi: {webhook_url}")
+    await bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
+    logger.info(f"Webhook o'rnatildi: {WEBHOOK_URL}")
 
 async def on_shutdown(app):
     await bot.delete_webhook()
     await bot.session.close()
 
+
 def main():
     app = web.Application()
     app.router.add_get("/", health_check)
 
-    # Eng barqaror aiogram webhook ulanishi
+    # Birinchi ishlagan original registratsiya
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
-    setup_application(app, dp, bot=bot)
 
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
 
     web.run_app(app, host="0.0.0.0", port=PORT)
+
 
 if __name__ == "__main__":
     main()
