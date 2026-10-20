@@ -2,6 +2,7 @@ import os
 import sys
 import logging
 import sqlite3
+import json
 from datetime import datetime
 import httpx
 from aiohttp import web
@@ -16,10 +17,10 @@ from aiogram.types import (
 )
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-# --- Asosiy Konfiguratsiya ---
+# --- Asosiy Sozlamalar ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
-    logging.critical("FATAL: BOT_TOKEN topilmadi! Render Environment'ga kiriting.")
+    logging.critical("FATAL: BOT_TOKEN muhit o'zgaruvchisi topilmadi!")
     sys.exit(1)
 
 PROVIDER_API_KEY = os.environ.get("PROVIDER_API_KEY", "hd_1729ff0cbba09a19877994bf65044cbba6bd")
@@ -28,11 +29,9 @@ PORT = int(os.environ.get("PORT", 8080))
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 PROVIDER_BASE_URL = "https://api.geminipro7.store"
 
-# Admin Telegram ID si
 ADMIN_ID = 5523761749
 
 # Qo'shilgan faol mahsulotlar (ID : Narxi Starsda)
-# Yangi mahsulot ID larini bersangiz, shu yerga qo'shib boramiz:
 ACTIVE_PRODUCTS = {
     "gp_1": {
         "title": "Gemini Pro (18 Months)",
@@ -48,7 +47,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 
-# --- Ma'lumotlar Bazasi (SQLite) ---
+# --- SQLite Ma'lumotlar Bazasi ---
 def init_db():
     conn = sqlite3.connect("bot_shop.db")
     cursor = conn.cursor()
@@ -95,17 +94,33 @@ def get_stats():
 init_db()
 
 
-# --- Upstream API Yordamchilari ---
-async def get_all_products():
+# --- Upstream API Bilan Ishlash ---
+async def fetch_upstream_products():
+    """Yetkazib beruvchidan tovarlar ro'yxatini yuklaydi va barcha variantlarni tekshiradi."""
     headers = {"X-API-Key": PROVIDER_API_KEY}
     async with httpx.AsyncClient(timeout=15.0) as client:
         try:
             res = await client.get(f"{PROVIDER_BASE_URL}/products", headers=headers)
-            if res.status_code == 200:
-                return res.json()
+            if res.status_code != 200:
+                logger.error(f"Products fetch error: {res.status_code} - {res.text}")
+                return []
+
+            data = res.json()
+            
+            # Agar javob to'g'ridan-to'g'ri list bo'lsa
+            if isinstance(data, list):
+                return data
+            
+            # Agar lug'at ichida kelsa
+            if isinstance(data, dict):
+                for key in ["products", "data", "items", "services"]:
+                    if key in data and isinstance(data[key], list):
+                        return data[key]
+                return [data]
+
             return []
         except Exception as e:
-            logger.error(f"Error fetching products: {e}")
+            logger.error(f"API fetch exception: {e}")
             return []
 
 async def get_provider_balance():
@@ -131,7 +146,7 @@ async def purchase_supplier_product(service_id: str, quantity: int = 1):
             res = await client.post(f"{PROVIDER_BASE_URL}/order", headers=headers, json=payload)
             return res.status_code, res.json()
         except Exception as e:
-            logger.error(f"Order error: {e}")
+            logger.error(f"Order API error: {e}")
             return 500, {"error": str(e)}
 
 
@@ -143,16 +158,16 @@ async def admin_orders(message: types.Message):
 
     orders = get_orders_list(limit=15)
     if not orders:
-        await message.answer("ℹ️ Hozircha hech qanday buyurtma mavjud emas.")
+        await message.answer("ℹ️ Hozircha buyurtmalar yo'q.")
         return
 
-    text = "📋 **Oxirgi 15 ta buyurtma:**\n\n"
+    text = "📋 **Oxirgi buyurtmalar:**\n\n"
     for order in orders:
-        status_icon = "✅ Yetkazildi" if order[4] == 1 else "❌ Xato (Yetkazilmadi)"
+        status_icon = "✅ Yetkazildi" if order[4] == 1 else "❌ Xato"
         text += (
             f"🔹 **Buyurtma #{order[0]}**\n"
-            f"👤 Xaridor: `{order[1]}`\n"
-            f"📦 Mahsulot: `{order[2]}`\n"
+            f"👤 User: `{order[1]}`\n"
+            f"📦 Mahsulot ID: `{order[2]}`\n"
             f"⭐ To'lov: {order[3]} Stars\n"
             f"📊 Holat: {status_icon}\n"
             f"🕒 Sana: {order[5]}\n"
@@ -172,11 +187,11 @@ async def admin_stats(message: types.Message):
 
     text = (
         "📊 **Bot Statistikasi:**\n\n"
-        f"👥 **Noyob xaridorlar:** {buyers} ta\n"
+        f"👥 **Xaridorlar:** {buyers} ta\n"
         f"📦 **Jami buyurtmalar:** {total_orders} ta\n"
-        f"✅ **Muvaffaqiyatli yetkazilgan:** {delivered_orders} ta\n"
-        f"📈 **Muvaffaqiyat ko'rsatkichi:** {success_rate}%\n"
-        f"⭐ **Jami to'langan Stars:** {total_stars:,} Stars"
+        f"✅ **Muvaffaqiyatli:** {delivered_orders} ta\n"
+        f"📈 **Muvaffaqiyat foizi:** {success_rate}%\n"
+        f"⭐ **Jami Stars:** {total_stars:,} Stars"
     )
     await message.answer(text, parse_mode="Markdown")
 
@@ -188,13 +203,63 @@ async def admin_balance(message: types.Message):
 
     bal_data = await get_provider_balance()
     if bal_data:
-        balance = bal_data.get("balance", "N/A")
-        await message.answer(f"💳 **Yetkazib beruvchi hisobingizdagi qoldiq:** `${balance}`", parse_mode="Markdown")
+        balance = bal_data.get("balance", bal_data.get("wallet", "N/A"))
+        await message.answer(f"💳 **Yetkazib beruvchi balansi:** `${balance}`", parse_mode="Markdown")
     else:
-        await message.answer("⚠️ Yetkazib beruvchi balansini olib bo'lmadi. API kalitni tekshiring.")
+        await message.answer("⚠️ Balansni olib bo'lmadi. API kalitni tekshiring.")
 
 
-# --- Foydalanuvchi Handlers ---
+@dp.message(Command("products"))
+async def admin_products_list(message: types.Message):
+    """Admin uchun mahsulotlarning Nomi, ID si va Narxini matn ko'rinishida chiqarib beradi."""
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    loading = await message.answer("🔄 Tovarlar yuklanmoqda...")
+    products = await fetch_upstream_products()
+
+    if not products:
+        await loading.edit_text("❌ Yetkazib beruvchida tovarlar topilmadi yoki API da xatolik.")
+        return
+
+    msg = "📦 **Ombordagi Barcha Mahsulotlar (Nomi - ID - Narxi):**\n\n"
+    for item in products:
+        p_id = item.get("service_id") or item.get("id") or item.get("product_id") or "Noma'lum"
+        name = item.get("name") or item.get("title") or "Nomsiz tovar"
+        price = item.get("price") or item.get("cost") or "0"
+
+        msg += (
+            f"🔹 **Nomi:** {name}\n"
+            f"🆔 **ID:** `{p_id}`\n"
+            f"💵 **Narxi:** `${price}`\n"
+            f"----------------------------\n"
+        )
+
+    await loading.delete()
+    # Telegram xabar chegarasidan oshmasligi uchun bo'laklab chiqarish
+    if len(msg) > 4000:
+        for chunk in [msg[i:i+4000] for i in range(0, len(msg), 4000)]:
+            await message.answer(chunk, parse_mode="Markdown")
+    else:
+        await message.answer(msg, parse_mode="Markdown")
+
+
+@dp.message(Command("debug"))
+async def admin_debug(message: types.Message):
+    """API dan kelayotgan xom javobni ko'rsatish."""
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    headers = {"X-API-Key": PROVIDER_API_KEY}
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            res = await client.get(f"{PROVIDER_BASE_URL}/products", headers=headers)
+            await message.answer(f"📡 **Status:** `{res.status_code}`\n\n```json\n{res.text[:3500]}\n```", parse_mode="Markdown")
+        except Exception as e:
+            await message.answer(f"❌ Xato: `{str(e)}`")
+
+
+# --- Foydalanuvchi Qismi ---
 @dp.message(CommandStart())
 async def start_handler(message: types.Message):
     welcome_text = (
@@ -213,7 +278,7 @@ async def start_handler(message: types.Message):
 @dp.callback_query(F.data == "show_catalog")
 async def show_catalog_handler(callback: types.CallbackQuery):
     await callback.answer("Tovarlar yuklanmoqda...")
-    products = await get_all_products()
+    products = await fetch_upstream_products()
 
     if not products:
         await callback.message.edit_text("❌ Omborda tovarlar topilmadi.")
@@ -221,13 +286,17 @@ async def show_catalog_handler(callback: types.CallbackQuery):
 
     buttons = []
     for item in products:
-        p_id = item.get("service_id") or item.get("id")
-        p_name = item.get("name", "Nomsiz mahsulot")
-        buttons.append([InlineKeyboardButton(text=f"📦 {p_name} (ID: {p_id})", callback_data=f"info_{p_id}")])
+        p_id = item.get("service_id") or item.get("id") or item.get("product_id") or "N/A"
+        name = item.get("name") or item.get("title") or "Mahsulot"
+        price = item.get("price") or item.get("cost") or "0"
+        
+        # Tugmada Nomi - ID - Narxi ko'rinadi
+        button_text = f"📦 {name} | ID: {p_id} (${price})"
+        buttons.append([InlineKeyboardButton(text=button_text, callback_data=f"info_{p_id}")])
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     await callback.message.edit_text(
-        "📦 **Ombordagi barcha tovarlar:**\n"
+        "📦 **Mavjud tovarlar ro'yxati:**\n"
         "Batafsil ma'lumot va xarid qilish uchun tanlang:",
         reply_markup=keyboard,
         parse_mode="Markdown"
@@ -237,8 +306,6 @@ async def show_catalog_handler(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("info_"))
 async def show_product_detail(callback: types.CallbackQuery):
     service_id = callback.data.replace("info_", "")
-    
-    # Agar botimizda qo'shilgan va sozlangan mahsulot bo'lsa
     product = ACTIVE_PRODUCTS.get(service_id)
 
     if product:
@@ -271,7 +338,7 @@ async def send_invoice(callback: types.CallbackQuery):
     service_id = callback.data.replace("buy_", "")
     product = ACTIVE_PRODUCTS.get(service_id)
     if not product:
-        await callback.answer("Ushbu mahsulot hozirda sotuvda mavjud emas.", show_alert=True)
+        await callback.answer("Ushbu mahsulot sotuvda mavjud emas.", show_alert=True)
         return
 
     await callback.answer()
@@ -307,12 +374,11 @@ async def process_payment(message: types.Message):
         deliverable = data.get("deliverable") or data.get("data") or data.get("account") or str(data)
         sup_order_id = str(data.get("order_id", "N/A"))
 
-        # Bazaga muvaffaqiyatli buyurtma sifatida yozish
         record_order(message.from_user.id, service_id, payment.total_amount, True, sup_order_id)
 
         await status_msg.edit_text(
             f"✅ **Xarid muvaffaqiyatli yakunlandi!**\n\n"
-            f"Sizning hisob/litsenziya ma'lumotlaringiz:\n"
+            f"Hisob/Litsenziya ma'lumotlaringiz:\n"
             f"```\n{deliverable}\n```\n\n"
             f"🔖 **Buyurtma ID:** `{sup_order_id}`\n"
             f"Xaridingiz uchun rahmat!",
@@ -322,12 +388,11 @@ async def process_payment(message: types.Message):
         err = data.get("message") or data.get("error") or "Noma'lum xatolik"
         logger.error(f"Fulfillment error: {err}")
 
-        # Bazaga yetkazilmagan xato buyurtma sifatida yozish
         record_order(message.from_user.id, service_id, payment.total_amount, False, "FAILED")
 
         await status_msg.edit_text(
-            "⚠️ **Yetkazib berishda nosozlik yuz berdi!**\n\n"
-            "Sizning to'lovingiz qabul qilindi, biroq ombor tizimida texnik kechikish yuz berdi. "
+            "⚠️ **Yetkazib berishda kechikish yuz berdi!**\n\n"
+            "To'lovingiz qabul qilindi, biroq ombor tizimida texnik xatolik chiqdi. "
             "Iltimos, adminga quyidagi to'lov ID sini yuboring:\n"
             f"`{payment.telegram_payment_charge_id}`",
             parse_mode="Markdown"
@@ -336,7 +401,7 @@ async def process_payment(message: types.Message):
 
 # --- Server & Webhook Lifecycle ---
 async def health_check(request):
-    return web.Response(text="Bot is running!")
+    return web.Response(text="Bot is operational")
 
 async def on_startup(app):
     if RENDER_EXTERNAL_URL:
